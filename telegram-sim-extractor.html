@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Telegram SIM Extractor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(160deg,#0a0a1a,#0f172a,#1a0a2e);min-height:100vh;font-family:"Noto Sans Thai",Sarabun,sans-serif;color:white}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-thumb{background:rgba(167,139,250,0.3);border-radius:2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@keyframes slideIn{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
+.spin{animation:spin 1s linear infinite}
+.pulse{animation:pulse 1.5s ease-in-out infinite}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const LS={
+  get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},
+  set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}},
+};
+
+// ── Telegram API ──────────────────────────────────────────────
+const tgGet=(bot,offset)=>
+  fetch(`https://api.telegram.org/bot${bot}/getUpdates?timeout=0&offset=${offset}`)
+  .then(r=>r.json());
+
+// ── Parse serial from Telegram message text ───────────────────
+const PATTERNS=[
+  /เลขซีเรียลซิม[:\s]*([0-9]{10,22})/,
+  /serial[:\s]+([0-9]{10,22})/i,
+  /s=([0-9]{10,22})/,
+  /📋[^\n]*?([0-9]{15,22})/,
+];
+const PHONE_PAT=/เบอร์โทร[:\s]*([0-9]{9,10})/;
+const TRACK_PAT=/เลขติดตาม[:\s]*([A-Z0-9]+)/;
+const TIME_PAT=/เวลา[:\s]*([^\n✅]+)/;
+
+function parseMsg(text){
+  let serial=null;
+  for(const p of PATTERNS){const m=text.match(p);if(m){serial=m[1].trim();break;}}
+  const phone=(text.match(PHONE_PAT)||[])[1]||null;
+  const tracking=(text.match(TRACK_PAT)||[])[1]||null;
+  const time=(text.match(TIME_PAT)||[])[1]?.trim()||null;
+  return{serial,phone,tracking,time};
+}
+
+// ── State ─────────────────────────────────────────────────────
+const state={
+  bot:LS.get("tg_bot")||"",
+  chat:LS.get("tg_chat")||"",
+  offset:parseInt(LS.get("tg_offset")||"0"),
+  polling:false,
+  status:"idle",// idle | polling | error
+  logs:[],// [{id,ts,text,serial,phone,tracking,time,raw}]
+  intervalId:null,
+  pollInterval:10,// วินาที
+};
+
+// ── Render ─────────────────────────────────────────────────────
+function $(id){return document.getElementById(id);}
+
+function render(){
+  const root=document.getElementById("root");
+  root.innerHTML=`
+  <div style="max-width:600px;margin:0 auto;padding:0 0 80px">
+
+    <!-- Header -->
+    <div style="background:rgba(15,15,40,0.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,0.08);padding:14px 16px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100">
+      <div style="width:42px;height:42px;background:linear-gradient(135deg,#4f46e5,#7c3aed);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">📡</div>
+      <div style="flex:1">
+        <div style="font-weight:800;font-size:16px">Telegram SIM Extractor</div>
+        <div style="font-size:11px;color:#8b8fa8;display:flex;align-items:center;gap:6px;margin-top:2px">
+          <span id="status-dot" style="width:7px;height:7px;border-radius:50%;background:${state.status==="polling"?"#6ee7b7":state.status==="error"?"#f87171":"#64748b"};display:inline-block;${state.status==="polling"?"box-shadow:0 0 6px #6ee7b7":""}"></span>
+          <span id="status-text">${state.status==="polling"?"กำลัง Polling ทุก "+state.pollInterval+" วิ...":state.status==="error"?"เกิดข้อผิดพลาด":"ยังไม่ได้เริ่ม"}</span>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="color:#a78bfa;font-weight:800;font-size:22px">${state.logs.length}</div>
+        <div style="color:#8b8fa8;font-size:10px">ข้อความ</div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:16px;margin:14px 12px 0">
+      <div style="font-size:13px;font-weight:700;color:#e2e8f0;margin-bottom:12px">⚙️ ตั้งค่า Telegram Bot</div>
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;color:#94a3b8;margin-bottom:5px">Bot Token</div>
+        <input id="inp-bot" type="text" value="${state.bot}" placeholder="110201543:AAHdqTcvCH1vGWJxfSeofSas0K5PALDsaw"
+          style="width:100%;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:10px 14px;color:white;font-size:13px;outline:none;font-family:monospace"/>
+      </div>
+      <div style="margin-bottom:14px">
+        <div style="font-size:11px;color:#94a3b8;margin-bottom:5px">Chat ID (ที่รับข้อความแจ้งเตือน)</div>
+        <input id="inp-chat" type="text" value="${state.chat}" placeholder="-1001234567890"
+          style="width:100%;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:10px 14px;color:white;font-size:13px;outline:none;font-family:monospace"/>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+        <div style="font-size:11px;color:#94a3b8">ดึงข้อมูลทุก</div>
+        ${[5,10,15,30].map(v=>`<button onclick="setInterval(${v})"
+          style="padding:6px 14px;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-weight:700;font-size:12px;
+          background:${state.pollInterval===v?"linear-gradient(135deg,#4f46e5,#7c3aed)":"rgba(255,255,255,0.08)"};
+          color:${state.pollInterval===v?"white":"#8b8fa8"}">${v}วิ</button>`).join("")}
+      </div>
+      <div style="display:flex;gap:8px">
+        <button onclick="saveAndStart()"
+          style="flex:1;padding:11px;border:none;border-radius:10px;background:linear-gradient(135deg,#22c55e,#16a34a);color:white;font-weight:700;font-size:14px;cursor:pointer;font-family:inherit">
+          ${state.polling?"🔴 หยุด Polling":"▶️ เริ่ม Polling"}
+        </button>
+        <button onclick="clearLogs()"
+          style="padding:11px 16px;border:1px solid rgba(239,68,68,0.3);border-radius:10px;background:rgba(239,68,68,0.12);color:#f87171;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit">
+          🗑 ล้าง
+        </button>
+      </div>
+    </div>
+
+    <!-- Live Feed -->
+    <div style="margin:14px 12px 0">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <div style="font-size:13px;font-weight:700;color:#e2e8f0">📥 ข้อความที่รับได้</div>
+        ${state.polling?`<div class="pulse" style="font-size:11px;color:#6ee7b7;background:rgba(5,150,105,0.15);border:1px solid rgba(5,150,105,0.3);padding:2px 10px;border-radius:99px">🔴 LIVE</div>`:""}
+      </div>
+
+      ${state.logs.length===0?`
+      <div style="text-align:center;padding:48px 16px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:16px;color:#475569">
+        <div style="font-size:40px;margin-bottom:10px">📭</div>
+        <div style="font-size:14px;color:#64748b">${state.polling?"กำลังรอข้อความจาก Telegram Bot...":"กรอก Bot Token แล้วกด เริ่ม Polling"}</div>
+      </div>`:
+      state.logs.map((log,i)=>`
+      <div style="background:${log.serial?"rgba(5,150,105,0.08)":"rgba(255,255,255,0.04)"};border:1px solid ${log.serial?"rgba(5,150,105,0.3)":"rgba(255,255,255,0.08)"};border-radius:14px;padding:14px;margin-bottom:10px;animation:slideIn 0.3s ease">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:${log.serial?10:0}">
+          <div style="font-size:11px;color:#64748b">${log.ts}</div>
+          ${log.serial?`<span style="background:#065f46;color:#6ee7b7;font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;flex-shrink:0">✅ มี Serial</span>`:`<span style="background:rgba(100,116,139,0.2);color:#94a3b8;font-size:10px;padding:2px 8px;border-radius:99px;flex-shrink:0">ข้อความทั่วไป</span>`}
+        </div>
+        ${log.serial?`
+        <div style="background:rgba(0,0,0,0.3);border-radius:10px;padding:10px 12px;margin-bottom:8px">
+          <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">📋 เลขซีเรียลซิม</div>
+          <div style="font-family:monospace;font-size:16px;font-weight:800;color:#6ee7b7;letter-spacing:1px">${log.serial}</div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+          ${log.phone?`<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:8px 10px"><div style="font-size:10px;color:#94a3b8">📞 เบอร์โทร</div><div style="font-size:13px;font-weight:700;color:#a5b4fc;margin-top:2px">${log.phone}</div></div>`:""}
+          ${log.tracking?`<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:8px 10px"><div style="font-size:10px;color:#94a3b8">🔢 เลขติดตาม</div><div style="font-size:13px;font-weight:700;color:#fbbf24;margin-top:2px">${log.tracking}</div></div>`:""}
+        </div>
+        ${log.time?`<div style="font-size:11px;color:#64748b">⏰ ${log.time}</div>`:""}
+        <div style="display:flex;gap:6px;margin-top:10px">
+          <button onclick="copyText('${log.serial}')" style="flex:1;padding:7px;border:1px solid rgba(110,231,183,0.3);border-radius:8px;background:rgba(5,150,105,0.12);color:#6ee7b7;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit">📋 คัดลอก Serial</button>
+          ${log.phone?`<button onclick="copyText('${log.phone}')" style="flex:1;padding:7px;border:1px solid rgba(165,180,252,0.3);border-radius:8px;background:rgba(79,70,229,0.12);color:#a5b4fc;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit">📞 คัดลอกเบอร์</button>`:""}
+        </div>
+        `:`
+        <div style="font-size:12px;color:#64748b;line-height:1.5;white-space:pre-wrap;max-height:60px;overflow:hidden">${escHtml(log.raw.slice(0,120))}${log.raw.length>120?"...":""}</div>
+        `}
+      </div>
+      `).join("")}
+    </div>
+
+  </div>`;
+
+  // Toast
+  if(state._toast){
+    const t=document.createElement("div");
+    t.innerHTML=state._toast;
+    t.style.cssText="position:fixed;top:20px;right:16px;z-index:9999;background:#059669;color:white;padding:10px 18px;border-radius:12px;font-weight:600;font-size:13px;box-shadow:0 4px 20px rgba(0,0,0,0.4);max-width:280px";
+    document.body.appendChild(t);
+    setTimeout(()=>t.remove(),2500);
+    state._toast=null;
+  }
+}
+
+function escHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+
+// ── Actions ───────────────────────────────────────────────────
+window.setInterval2=window.setInterval; // keep native
+window.setInterval=(v)=>{
+  state.pollInterval=v;
+  if(state.polling){stopPolling();startPolling();}
+  render();
+};
+
+window.saveAndStart=()=>{
+  state.bot=$("inp-bot").value.trim();
+  state.chat=$("inp-chat").value.trim();
+  LS.set("tg_bot",state.bot);
+  LS.set("tg_chat",state.chat);
+  if(state.polling){stopPolling();}
+  else{
+    if(!state.bot){alert("กรุณากรอก Bot Token ก่อนครับ");return;}
+    startPolling();
+  }
+};
+
+window.clearLogs=()=>{
+  if(state.logs.length&&!confirm("ล้างประวัติทั้งหมด?"))return;
+  state.logs=[];
+  render();
+};
+
+window.copyText=(txt)=>{
+  navigator.clipboard.writeText(txt).then(()=>{
+    state._toast="✅ คัดลอกแล้ว: "+txt;
+    render();
+  });
+};
+
+// ── Polling ───────────────────────────────────────────────────
+async function poll(){
+  if(!state.bot)return;
+  try{
+    const data=await tgGet(state.bot,state.offset);
+    if(!data.ok||!data.result?.length)return;
+    let maxId=state.offset;
+    let changed=false;
+    for(const upd of data.result){
+      if(upd.update_id>=maxId)maxId=upd.update_id+1;
+      const raw=upd.message?.text||upd.channel_post?.text||"";
+      if(!raw)continue;
+      const {serial,phone,tracking,time}=parseMsg(raw);
+      const ts=upd.message?.date||upd.channel_post?.date;
+      const tsStr=ts?new Date(ts*1000).toLocaleString("th-TH"):new Date().toLocaleString("th-TH");
+      state.logs.unshift({id:upd.update_id,ts:tsStr,raw,serial,phone,tracking,time});
+      changed=true;
+    }
+    if(changed){
+      state.logs=state.logs.slice(0,100);// เก็บสูงสุด 100 รายการ
+    }
+    if(maxId!==state.offset){
+      state.offset=maxId;
+      LS.set("tg_offset",String(maxId));
+    }
+    state.status="polling";
+    if(changed)render();
+    else updateStatusOnly();
+  }catch(e){
+    state.status="error";
+    updateStatusOnly();
+  }
+}
+
+function updateStatusOnly(){
+  const dot=$("status-dot");
+  const txt=$("status-text");
+  if(dot)dot.style.background=state.status==="polling"?"#6ee7b7":state.status==="error"?"#f87171":"#64748b";
+  if(txt)txt.textContent=state.status==="polling"?"กำลัง Polling ทุก "+state.pollInterval+" วิ...":state.status==="error"?"เกิดข้อผิดพลาด — ตรวจสอบ Bot Token":"ยังไม่ได้เริ่ม";
+}
+
+function startPolling(){
+  state.polling=true;
+  state.status="polling";
+  poll();
+  state._iv=window.setInterval2(poll,state.pollInterval*1000);
+  render();
+}
+
+function stopPolling(){
+  state.polling=false;
+  state.status="idle";
+  if(state._iv){clearInterval(state._iv);state._iv=null;}
+  render();
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+render();
+if(state.bot){
+  // Auto-start ถ้ามี token บันทึกไว้แล้ว
+  setTimeout(startPolling,500);
+}
+</script>
+</body>
+</html>
